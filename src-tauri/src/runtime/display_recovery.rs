@@ -136,6 +136,35 @@ impl Runtime {
         Ok(())
     }
 
+    pub(super) async fn recover_uncertain_display(&self, link: &Link) -> Result<()> {
+        if self.snapshot().await.display_status != "uncertain" {
+            return Ok(());
+        }
+        // A transient DDC read failure once marked the picture uncertain.
+        // Instead of demanding a full stop/start, re-observe both ends: an
+        // agreed fresh read is as trustworthy as the state before the failure.
+        match self.query_display_source(link).await {
+            Ok(source) => {
+                let mut i = self.inner.lock().await;
+                ensure!(self.current(link), "共享会话已结束");
+                if i.state.display_status == "uncertain" {
+                    i.state.display_device_id = Some(source.clone());
+                    i.state.display_status = "commanded".into();
+                    drop(i);
+                    self.trace(
+                        "display.uncertainRecovered",
+                        json!({"source":source,"pictureVerified":false}),
+                    )
+                    .await;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                Err(error).context("画面状态不确定，自动重新读取也未成功；请稍后重试或重新开始共享")
+            }
+        }
+    }
+
     pub(super) async fn confirm_resumed_switch(
         &self,
         link: &Link,
@@ -146,9 +175,38 @@ impl Runtime {
             _ = link.session.closed.cancelled() => bail!("共享会话已结束"),
             _ = tokio::time::sleep(Duration::from_millis(500)) => {}
         }
-        let source = match self.detect_resumed_source(link, token).await {
-            Ok(source) => source,
-            Err(error) => {
+        // The monitor may still be resyncing right after an input switch and
+        // refuse DDC/CI reads for a second or two. Re-read a few times before
+        // declaring the picture unverifiable.
+        let mut settled = None;
+        let mut last_error = None;
+        for attempt in 0..3u32 {
+            match self.query_display_source(link).await {
+                Ok(source) => {
+                    settled = Some(source);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+            }
+        }
+        let source = match settled {
+            Some(source) => {
+                let mut i = self.inner.lock().await;
+                ensure!(self.current(link), "共享会话已结束");
+                i.state.display_device_id = Some(source.clone());
+                i.state.display_status = "commanded".into();
+                drop(i);
+                let mut recovery = self.display_recovery.lock().await;
+                if recovery.pending() == Some(token) {
+                    recovery.detected = Some(token);
+                }
+                source
+            }
+            None => {
+                let error = last_error.expect("readback retry loop produced no error");
                 if self.current(link) {
                     let mut i = self.inner.lock().await;
                     i.state.display_device_id = None;
@@ -371,5 +429,119 @@ mod tests {
             state.pending().is_some(),
             "An unread source must not expire into cached routing"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn uncertain_display_recovers_after_a_fresh_agreed_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = super::super::pointer_bridge::tests::fixture(directory.path(), "host");
+        let local = runtime.snapshot().await.device_id;
+        {
+            let mut i = runtime.inner.lock().await;
+            i.state.display_device_id = None;
+            i.state.display_status = "uncertain".into();
+            i.state.config.display_id = "external".into();
+            i.state.config.local_input = Some(15);
+            i.state.peer = Some(Peer {
+                id: "receiver".into(),
+                name: "Receiver".into(),
+                platform: "win32".into(),
+                fingerprint: "a".repeat(64),
+                file_transfer: false,
+                lock_control: false,
+                input_configured: true,
+                retained_display: false,
+                modifier_mapping: ModifierMapping::Original,
+            });
+        }
+        let helper = runtime.platform.resources.join("native/bin/m1ddc");
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nif test \"$3\" = get; then echo 15; exit 0; fi\nexit 9\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (remote, mut requests) =
+            super::super::pointer_bridge::tests::attach_with_requests(&runtime).await;
+        let expected = local.clone();
+        let task_remote = remote.clone();
+        let receiver = tokio::spawn(async move {
+            while let Some(next) = requests.recv().await {
+                if let Incoming::Request { id, method, .. } = next {
+                    assert_eq!(method, "get-input-source");
+                    task_remote
+                        .reply(id, Ok(json!(expected.clone())))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let link = runtime.link.lock().await.clone().unwrap();
+        runtime.recover_uncertain_display(&link).await.unwrap();
+        let state = runtime.snapshot().await;
+        assert_eq!(state.display_status, "commanded");
+        assert_eq!(state.display_device_id, Some(local));
+        remote.close();
+        receiver.await.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn uncertain_display_stays_uncertain_when_fresh_reads_keep_failing() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = super::super::pointer_bridge::tests::fixture(directory.path(), "host");
+        {
+            let mut i = runtime.inner.lock().await;
+            i.state.display_device_id = None;
+            i.state.display_status = "uncertain".into();
+            i.state.config.display_id = "external".into();
+            i.state.config.local_input = Some(15);
+            i.state.peer = Some(Peer {
+                id: "receiver".into(),
+                name: "Receiver".into(),
+                platform: "win32".into(),
+                fingerprint: "a".repeat(64),
+                file_transfer: false,
+                lock_control: false,
+                input_configured: true,
+                retained_display: false,
+                modifier_mapping: ModifierMapping::Original,
+            });
+        }
+        let helper = runtime.platform.resources.join("native/bin/m1ddc");
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nif test \"$3\" = get; then echo 'Invalid or unsupported DDC/CI reply' >&2; exit 1; fi\nexit 9\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (remote, mut requests) =
+            super::super::pointer_bridge::tests::attach_with_requests(&runtime).await;
+        let task_remote = remote.clone();
+        let receiver = tokio::spawn(async move {
+            while let Some(next) = requests.recv().await {
+                if let Incoming::Request { id, method, .. } = next {
+                    assert_eq!(method, "get-input-source");
+                    task_remote.reply(id, Ok(json!(Value::Null))).await.unwrap();
+                }
+            }
+        });
+        let link = runtime.link.lock().await.clone().unwrap();
+        let error = runtime
+            .recover_uncertain_display(&link)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("画面状态不确定"), "{error}");
+        let state = runtime.snapshot().await;
+        assert_eq!(state.display_status, "uncertain");
+        assert_eq!(state.display_device_id, None);
+        remote.close();
+        receiver.await.unwrap();
     }
 }

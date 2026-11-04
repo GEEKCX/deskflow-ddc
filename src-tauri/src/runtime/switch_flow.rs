@@ -15,6 +15,7 @@ impl Runtime {
         }))
     }
     async fn write_display_with_retry(&self, link: &Link, target: &str) -> Result<()> {
+        self.recover_uncertain_display(link).await?;
         let initial = self.snapshot().await;
         // A read reply may be stale, cached or connection-specific. It is not
         // evidence of the physical picture and must not rewrite routing/target.
@@ -101,6 +102,7 @@ impl Runtime {
         self.publish();
     }
     pub(super) async fn write_display(&self, link: &Link, target: &str) -> Result<()> {
+        self.recover_uncertain_display(link).await?;
         let s = self.snapshot().await;
         ensure!(
             s.display_status != "uncertain",
@@ -311,7 +313,7 @@ impl Runtime {
         // this before awaiting completion so the observer can acknowledge it.
         let effects = self.effects.lock().await;
         ensure!(self.current(link), "共享会话已结束");
-        let s = self.snapshot().await;
+        let mut s = self.snapshot().await;
         ensure!(
             s.engine == "ready" && !s.switching,
             "键鼠尚未就绪或正在切换"
@@ -328,6 +330,12 @@ impl Runtime {
                 .as_ref()
                 .is_some_and(|l| l.video == "manual")
         {
+            if s.display_status == "uncertain" {
+                // Manual-mode edge transfers must not wedge after a transient
+                // DDC failure; try a fresh observation before vetoing.
+                self.recover_uncertain_display(link).await?;
+                s = self.snapshot().await;
+            }
             let retained = if target == s.device_id {
                 pointer::selected(&s.cursor_displays, &s.config.retained_display_id).is_some()
             } else {
@@ -401,8 +409,9 @@ impl Runtime {
             None => s.device_id.clone(),
         };
         self.trace("switch.command", json!({"target":target,"active":s.active_device_id,"display":s.display_device_id,"session":link.id})).await;
+        self.recover_uncertain_display(link).await?;
         ensure!(
-            s.display_status != "uncertain",
+            self.snapshot().await.display_status != "uncertain",
             "画面状态不确定，请手动恢复提供端画面后重新开始共享"
         );
         // An inactive input may not appear in the target's display enumeration.

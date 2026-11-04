@@ -271,6 +271,20 @@ impl Platform {
         Ok(())
     }
     pub async fn current_input(&self, id: &str) -> Result<Option<u16>> {
+        // Some monitors briefly refuse DDC/CI reads around input switches or
+        // wake (e.g. an invalid reply right after the source changes). A short
+        // retry turns a flaky read into a slower read instead of a poisoned
+        // shared-display state.
+        for attempt in 0..3u32 {
+            let result = self.current_input_once(id).await;
+            if matches!(&result, Ok(Some(_))) || attempt == 2 {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        unreachable!()
+    }
+    async fn current_input_once(&self, id: &str) -> Result<Option<u16>> {
         if platform() == "linux" {
             return self.linux_current_input(id).await;
         }
@@ -423,6 +437,54 @@ mod tests {
                 .count(),
             700
         );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn flaky_input_read_is_retried_until_it_answers() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("native/bin/m1ddc");
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nif test \"$3\" = get; then n=$(cat \"$0.count\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$0.count\"; if test \"$n\" -lt 3; then echo 'Invalid or unsupported DDC/CI reply' >&2; exit 1; fi; echo 15; exit 0; fi\nexit 9\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let platform = Platform::new(directory.path().into());
+        let value = platform.current_input("external").await.unwrap();
+        assert_eq!(value, Some(15));
+        let calls = std::fs::read_to_string(helper.with_extension("count"))
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert_eq!(calls, "3");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_input_read_stops_after_three_attempts() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("native/bin/m1ddc");
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nif test \"$3\" = get; then n=$(cat \"$0.count\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$0.count\"; echo 'Invalid or unsupported DDC/CI reply' >&2; exit 1; fi\nexit 9\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let platform = Platform::new(directory.path().into());
+        let error = platform
+            .current_input("external")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Invalid or unsupported DDC/CI reply"));
+        let calls = std::fs::read_to_string(helper.with_extension("count"))
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert_eq!(calls, "3");
     }
     #[test]
     fn display_scan_keeps_names_and_ignores_diagnostic_lines() {
