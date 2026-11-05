@@ -171,7 +171,15 @@ pub fn prepare(
         &root.join("server.conf"),
         server_config(c, local, &peer.id.to_string(), peer.retained_display)?.as_bytes(),
     )?;
-    let mut text=format!("[core]\ncomputerName=sb-{local}\ncoreMode={}\nprocessMode=0\nport={}\ninterface=\npreventSleep=false\n\n[security]\ntlsEnabled=true\ncheckPeerFingerprints=true\ncertificate={}\n\n[client]\nremoteHost={}\n\n[server]\nexternalConfig=true\nexternalConfigFile={}\nenableClipboard={}\nclipboardSize={}\n\n[log]\nlevel=INFO\ntoFile=false\n\n",if c.role=="host"{2}else{1},c.deskflow_port,ini(&tls.join("identity.pem").to_string_lossy()),ini(address),ini(&root.join("server.conf").to_string_lossy()),c.clipboard,c.clipboard_megabytes);
+    let mut text=format!("[core]\ncomputerName=sb-{local}\ncoreMode={}\nprocessMode=0\nport={}\ninterface=\npreventSleep=false\n\n[security]\ntlsEnabled=true\ncheckPeerFingerprints=true\ncertificate={}\n\n[client]\nremoteHost={}\n",if c.role=="host"{2}else{1},c.deskflow_port,ini(&tls.join("identity.pem").to_string_lossy()),ini(address));
+    // macOS "natural scrolling" utilities (e.g. Mos) invert wheel events
+    // before this app forwards them, so a Windows receiver sees the opposite
+    // direction from what the provider feels. Re-invert on the client instead
+    // of asking every Mac provider to uninstall Mos.
+    if c.role == "host" && crate::model::platform() == "darwin" && peer.platform == "win32" {
+        text += "invertYScroll=true\n";
+    }
+    text += &format!("\n[server]\nexternalConfig=true\nexternalConfigFile={}\nenableClipboard={}\nclipboardSize={}\n\n[log]\nlevel=INFO\ntoFile=false\n\n",ini(&root.join("server.conf").to_string_lossy()),c.clipboard,c.clipboard_megabytes);
     text += &computer_settings(c, local, peer, crate::model::platform());
     let settings = root.join("Deskflow.conf");
     atomic_write(&settings, text.as_bytes())?;
